@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "90gundem",
+  "name": "90gundem-deploy",
   "main": "src/index.js",
   "compatibility_date": "2026-09-05",
   "triggers": { "crons": ["*/2 * * * *"] },
@@ -8,7 +8,7 @@
     {
       "binding": "DB",
       "database_name": "90gundem-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "4384ca50-104f-4213-ba67-2a6253cb7b50"
     }
   ],
   "vars": {

@@ -11,7 +11,7 @@
       "database_id": "4384ca50-104f-4213-ba67-2a6253cb7b50"
     }
   ],
-  "images": { "binding": "IMAGES" },
+  "browser": { "binding": "BROWSER" },
   "vars": {
     "X_PUBLISH_ENABLED": "false",
     "X_DAILY_POST_LIMIT": "1",

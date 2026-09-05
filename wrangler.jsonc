@@ -1,10 +1,9 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "90gundem-deploy",
-  "main": "src/index.js",
+  "main": "src/index-v4.js",
   "compatibility_date": "2026-09-05",
   "triggers": { "crons": ["*/2 * * * *"] },
-  "images": { "binding": "IMAGES" },
   "d1_databases": [
     {
       "binding": "DB",
@@ -12,6 +11,7 @@
       "database_id": "4384ca50-104f-4213-ba67-2a6253cb7b50"
     }
   ],
+  "images": { "binding": "IMAGES" },
   "vars": {
     "X_PUBLISH_ENABLED": "false",
     "X_DAILY_POST_LIMIT": "1",

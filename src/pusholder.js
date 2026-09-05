@@ -1,12 +1,14 @@
-// Pusholder fast lane: public Telegram preview. Cache-busted and observable for scheduled polling.
+// Pusholder fast lane: always request the channel's actual latest public preview.
 const BASE='https://t.me/s/pusholder';
 const dec=s=>String(s||'').replace(/<br\s*\/?>/gi,'\n').replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
 export async function fetchPusholder(){
-  const url=`${BASE}?before=999999999999&cb=${Date.now()}`;
-  const r=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0 (compatible; 90Gundem/25.0)','Accept':'text/html,application/xhtml+xml','Cache-Control':'no-cache','Pragma':'no-cache'},redirect:'follow',cf:{cacheTtl:0,cacheEverything:false}});
+  // IMPORTANT: do not use ?before=... here. Telegram interprets it as pagination
+  // and it can pin the worker to an older page instead of the live channel tail.
+  const url=`${BASE}?cb=${Date.now()}`;
+  const r=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0 (compatible; 90Gundem/27.0)','Accept':'text/html,application/xhtml+xml','Cache-Control':'no-cache, no-store, max-age=0','Pragma':'no-cache'},redirect:'follow',cf:{cacheTtl:0,cacheEverything:false}});
   if(!r.ok)throw new Error(`pusholder_http_${r.status}`);
   const h=await r.text();
-  const blocks=h.split(/<div class="tgme_widget_message_wrap[^>]*>/i).slice(1,41),out=[];
+  const blocks=h.split(/<div class="tgme_widget_message_wrap[^>]*>/i).slice(1,51),out=[];
   for(const b of blocks){
     const id=b.match(/data-post=["']pusholder\/(\d+)/i)?.[1];
     const tm=b.match(/<time[^>]+datetime=["']([^"']+)/i)?.[1];
@@ -18,6 +20,7 @@ export async function fetchPusholder(){
     out.push({source:'Pusholder Telegram',publisher:'Pusholder',trust:100,direct:true,title:first.slice(0,180),description:body,link:`https://t.me/pusholder/${id}`,pubDate:new Date(ts).toUTCString(),ts,image:im?decodeURIComponent(im):'',pusholder_id:id});
   }
   if(!out.length)throw new Error(`pusholder_parse_empty_${h.length}`);
-  return out.sort((a,b)=>b.ts-a.ts);
+  const unique=[...new Map(out.map(x=>[x.pusholder_id,x])).values()].sort((a,b)=>Number(b.pusholder_id)-Number(a.pusholder_id));
+  return unique;
 }
 export const PUSHOLDER_CHANNEL=BASE;

@@ -5,216 +5,35 @@ const FEEDS = [
   { source: "Habertürk Gündem", publisher: "Habertürk", url: "https://www.haberturk.com/rss/kategori/gundem.xml" },
   { source: "Habertürk Ekonomi", publisher: "Habertürk", url: "https://www.haberturk.com/rss/ekonomi.xml" },
   { source: "Haberler.com", publisher: "Haberler.com", url: "https://rss.haberler.com/RssNew.aspx" },
+  { source: "Sözcü Son Dakika", publisher: "Sözcü", url: "https://www.sozcu.com.tr/feeds-son-dakika" },
+  { source: "Sözcü Gündem", publisher: "Sözcü", url: "https://www.sozcu.com.tr/feeds-rss-category-gundem" },
+  { source: "Sözcü Ekonomi", publisher: "Sözcü", url: "https://www.sozcu.com.tr/feeds-rss-category-ekonomi" },
+  { source: "Hürriyet", publisher: "Hürriyet", url: "https://rss.hurriyet.com.tr/" },
 ];
 
 const STOP = new Set("ve veya ile için bir bu şu o da de mi mı mu mü son dakika haber haberi haberleri yeni göre olarak daha en çok ise var oldu olan ilgili ardından sonra önce bugün türkiye türkiyede açıklama açıkladı dikkat çeken gelişme gelişmeler sıcak flaş".split(" "));
-
-function decodeXml(value = "") {
-  return value.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-}
-
-function parseItems(xml, feed) {
-  return [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)].slice(0, 15).map((match) => {
-    const block = match[1];
-    const get = (tag) => {
-      const found = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-      return decodeXml(found?.[1] || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    };
-    return { title: get("title"), link: get("link") || get("guid"), pubDate: get("pubDate") || get("dc:date") || get("date"), source: get("source") || feed.source, publisher: feed.publisher };
-  });
-}
-
-async function ensureSchema(env) {
-  await env.DB.batch([
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS worker_state (key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS news_queue (fingerprint TEXT PRIMARY KEY,title TEXT NOT NULL,source_url TEXT,primary_source TEXT NOT NULL,sources TEXT NOT NULL,source_count INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'ready',first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
-    env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_news_queue_status ON news_queue(status,last_seen)"),
-  ]);
-}
-
-async function stateGet(env, key) {
-  const row = await env.DB.prepare("SELECT value FROM worker_state WHERE key=?").bind(key).first();
-  return row?.value ?? null;
-}
-
-async function stateSet(env, key, value) {
-  await env.DB.prepare("INSERT INTO worker_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(key, String(value)).run();
-}
-
-function normalize(text) {
-  return String(text || "").toLocaleLowerCase("tr-TR").replace(/[^a-z0-9çğıöşü ]/gi, " ").replace(/\s+/g, " ").trim();
-}
-function tokenSet(text) { return new Set(normalize(text).split(" ").filter((x) => x.length > 2 && !STOP.has(x))); }
-function overlap(a, b) {
-  if (!a.size || !b.size) return 0;
-  let shared = 0;
-  for (const x of a) if (b.has(x)) shared++;
-  return shared / Math.min(a.size, b.size);
-}
-function eventScore(a, b) {
-  const A = tokenSet(a), B = tokenSet(b);
-  let shared = 0;
-  for (const x of A) if (B.has(x)) shared++;
-  const lexical = overlap(A, B);
-  if (shared >= 3 && lexical >= 0.38) return Math.max(0.60, lexical);
-  if (shared >= 2 && lexical >= 0.50) return Math.max(0.56, lexical);
-  return lexical;
-}
-
-async function sha256(text) {
-  const data = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return [...new Uint8Array(data)].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-async function eventFingerprint(cluster) {
-  const counts = new Map();
-  for (const item of cluster.items) for (const token of tokenSet(item.title)) counts.set(token, (counts.get(token) || 0) + 1);
-  let shared = [...counts].filter(([, count]) => count >= 2).map(([token]) => token).sort();
-  if (shared.length < 2) shared = [...tokenSet(cluster.primary.title)].sort().slice(0, 6);
-  return sha256(shared.slice(0, 8).join("|"));
-}
-
-async function telegram(env, method, body = {}) {
-  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("missing_TELEGRAM_BOT_TOKEN");
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const json = await response.json();
-  if (!json.ok) throw new Error(`telegram_${method}:${JSON.stringify(json).slice(0, 300)}`);
-  return json.result;
-}
-
-async function telegramChatId(env) { return env.TELEGRAM_CHAT_ID || await stateGet(env, "telegram_chat_id"); }
-async function telegramReady(env) { return Boolean(env.TELEGRAM_BOT_TOKEN && await telegramChatId(env)); }
-
-function shareText(title) {
-  const suffix = "\n\n#SonDakika #Gündem";
-  let clean = String(title).replace(/\s+-\s+[^-]{2,60}$/, "").trim();
-  if (clean.length > 280 - suffix.length) clean = clean.slice(0, 280 - suffix.length - 1).trimEnd() + "…";
-  return clean + suffix;
-}
-function xIntent(title) { return `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText(title))}`; }
-
-async function notifyTelegram(env, item) {
-  const chatId = await telegramChatId(env);
-  if (!chatId) return false;
-  await telegram(env, "sendMessage", {
-    chat_id: chatId,
-    text: `📰 +90 GÜNDEM ONAY\n\n${item.title}\n\nKaynaklar: ${item.sources.join(" • ")}\nDoğrulama: ${item.sources.length} bağımsız yayıncı`,
-    disable_web_page_preview: true,
-    reply_markup: { inline_keyboard: [[{ text: "✅ ONAYLA", callback_data: `approve:${item.fp}` }, { text: "❌ REDDET", callback_data: `reject:${item.fp}` }]] },
-  });
-  return true;
-}
-
-async function setupTelegram(request, env) {
-  if (!env.TELEGRAM_BOT_TOKEN) return Response.json({ status: "error", error: "TELEGRAM_BOT_TOKEN missing" }, { status: 500 });
-  const existing = await telegramChatId(env);
-  if (existing) return Response.json({ status: "already_configured", telegram_ready: true });
-  const updates = await telegram(env, "getUpdates", { limit: 20, timeout: 0, allowed_updates: ["message"] });
-  const starts = updates.filter((u) => u.message?.chat?.type === "private" && String(u.message?.text || "").trim().startsWith("/start"));
-  if (!starts.length) return Response.json({ status: "waiting", telegram_ready: false, message: "Bota /start gönderip tekrar aç." });
-  const chatId = String(starts.at(-1).message.chat.id);
-  const secret = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
-  await stateSet(env, "telegram_chat_id", chatId);
-  await stateSet(env, "telegram_webhook_secret", secret);
-  await telegram(env, "setWebhook", { url: `${new URL(request.url).origin}/telegram/webhook`, secret_token: secret, allowed_updates: ["callback_query"], drop_pending_updates: true });
-  await telegram(env, "sendMessage", { chat_id: chatId, text: "✅ +90 GÜNDEM bağlantısı tamamlandı. Doğrulanan haberler onay için buraya gelecek." });
-  return Response.json({ status: "configured", telegram_ready: true, webhook_ready: true });
-}
-
-async function answerCallback(env, id, text) { try { await telegram(env, "answerCallbackQuery", { callback_query_id: id, text }); } catch {} }
-
-async function handleTelegram(request, env) {
-  const chatId = await telegramChatId(env);
-  const secret = env.TELEGRAM_WEBHOOK_SECRET || await stateGet(env, "telegram_webhook_secret");
-  if (!secret || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== secret) return new Response("forbidden", { status: 403 });
-  const update = await request.json();
-  const query = update.callback_query;
-  if (!query?.data) return Response.json({ ok: true });
-  if (!chatId || String(query.message?.chat?.id) !== String(chatId)) { await answerCallback(env, query.id, "Yetkisiz sohbet"); return Response.json({ ok: true }); }
-  const [action, fp] = query.data.split(":");
-  const row = await env.DB.prepare("SELECT * FROM news_queue WHERE fingerprint=?").bind(fp).first();
-  if (!row) { await answerCallback(env, query.id, "Haber bulunamadı"); return Response.json({ ok: true }); }
-  if (action === "reject") {
-    await env.DB.prepare("UPDATE news_queue SET status='rejected',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(fp).run();
-    await telegram(env, "editMessageReplyMarkup", { chat_id: query.message.chat.id, message_id: query.message.message_id, reply_markup: { inline_keyboard: [] } });
-    await answerCallback(env, query.id, "Reddedildi");
-  } else if (action === "approve") {
-    await env.DB.prepare("UPDATE news_queue SET status='approved',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(fp).run();
-    await telegram(env, "editMessageReplyMarkup", { chat_id: query.message.chat.id, message_id: query.message.message_id, reply_markup: { inline_keyboard: [[{ text: "𝕏 X'te Paylaş", url: xIntent(row.title) }]] } });
-    await answerCallback(env, query.id, "Onaylandı");
-  }
-  return Response.json({ ok: true });
-}
-
-async function fetchFeeds() {
-  return Promise.all(FEEDS.map(async (feed) => {
-    try {
-      const response = await fetch(feed.url, { headers: { "User-Agent": "90Gundem/1.0", Accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.5" } });
-      if (!response.ok) return { ...feed, ok: false, status: response.status, items: [] };
-      return { ...feed, ok: true, status: response.status, items: parseItems(await response.text(), feed) };
-    } catch (error) { return { ...feed, ok: false, status: 0, error: String(error?.message || error), items: [] }; }
-  }));
-}
-
-function verifiedClusters(fresh, threshold = 0.52) {
-  const clusters = [];
-  for (const item of fresh) {
-    let best = null, bestScore = 0;
-    for (const cluster of clusters) {
-      let score = 0;
-      for (const old of cluster.items) score = Math.max(score, eventScore(item.title, old.title));
-      if (score > bestScore) { bestScore = score; best = cluster; }
-    }
-    if (best && bestScore >= threshold) {
-      best.items.push(item); best.publishers.add(item.publisher);
-      if (new Date(item.pubDate) > new Date(best.primary.pubDate)) best.primary = item;
-    } else clusters.push({ primary: item, items: [item], publishers: new Set([item.publisher]) });
-  }
-  return clusters.filter((cluster) => cluster.publishers.size >= 2).sort((a, b) => new Date(b.primary.pubDate) - new Date(a.primary.pubDate));
-}
-
-async function queueCluster(env, cluster) {
-  const fp = await eventFingerprint(cluster), sources = [...cluster.publishers];
-  const existing = await env.DB.prepare("SELECT status FROM news_queue WHERE fingerprint=?").bind(fp).first();
-  if (existing) {
-    await env.DB.prepare("UPDATE news_queue SET sources=?,source_count=?,last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(JSON.stringify(sources), sources.length, fp).run();
-    return { ...cluster.primary, fp, sources, isNew: false, status: existing.status };
-  }
-  await env.DB.prepare("INSERT INTO news_queue(fingerprint,title,source_url,primary_source,sources,source_count,status) VALUES(?,?,?,?,?,?,'ready')").bind(fp, cluster.primary.title, cluster.primary.link, cluster.primary.source, JSON.stringify(sources), sources.length).run();
-  return { ...cluster.primary, fp, sources, isNew: true, status: "ready" };
-}
-
-async function scan(env, maxAgeOverride = null, mode = "scheduled") {
-  await ensureSchema(env);
-  const maxAgeMinutes = maxAgeOverride ?? Number(env.X_MAX_AGE_MINUTES || 3);
-  const feeds = await fetchFeeds(), all = feeds.flatMap((feed) => feed.items), now = Date.now();
-  const fresh = all.filter((item) => { const ts = new Date(item.pubDate).getTime(); const age = now - ts; return item.title && Number.isFinite(ts) && age >= 0 && age <= maxAgeMinutes * 60000; }).sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
-  const verified = verifiedClusters(fresh, Number(env.NEWS_TITLE_SIMILARITY || 0.52)), queued = [];
-  let notified = 0, lastError = null;
-  for (const cluster of verified.slice(0, 5)) {
-    const item = await queueCluster(env, cluster); queued.push(item);
-    if (item.isNew && await telegramReady(env)) {
-      try { if (await notifyTelegram(env, item)) { await env.DB.prepare("UPDATE news_queue SET status='pending_approval',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(item.fp).run(); notified++; } }
-      catch (error) { lastError = String(error?.message || error); }
-    }
-  }
-  const state = { at: new Date().toISOString(), mode, max_age_minutes: maxAgeMinutes, matching: "event-v2-clean", feed_status: feeds.map((feed) => ({ source: feed.source, ok: feed.ok, status: feed.status, items: feed.items.length })), fetched: all.length, fresh: fresh.length, verified: verified.length, queued: queued.length, telegram_ready: await telegramReady(env), telegram_notified: notified, x_api_publishing: false, lastError };
-  await stateSet(env, "last_scan", JSON.stringify(state));
-  return state;
-}
-
-export default {
-  async fetch(request, env) {
-    await ensureSchema(env);
-    const url = new URL(request.url);
-    if (url.pathname === "/telegram-setup" && request.method === "GET") return setupTelegram(request, env);
-    if (url.pathname === "/telegram/webhook" && request.method === "POST") return handleTelegram(request, env);
-    if (url.pathname === "/health") return Response.json({ status: "ok", service: "90gundem-cloudflare", version: "event-v2-clean", telegram_ready: await telegramReady(env), x_api_publishing: false });
-    if (url.pathname === "/status") { const raw = await stateGet(env, "last_scan"); const q = await env.DB.prepare("SELECT status,COUNT(*) n FROM news_queue GROUP BY status").all(); return Response.json({ status: "ok", queue: Object.fromEntries((q.results || []).map((x) => [x.status, Number(x.n)])), last_scan: raw ? JSON.parse(raw) : null }); }
-    if (url.pathname === "/run-once") { try { return Response.json({ status: "ok", ...await scan(env, 60, "manual-verification-test") }); } catch (error) { return Response.json({ status: "error", error: String(error?.message || error) }, { status: 500 }); } }
-    return new Response("90+ GUNDEM Cloudflare Worker", { status: 200 });
-  },
-  async scheduled(controller, env, ctx) {
-    ctx.waitUntil(scan(env, null, "scheduled").catch(async (error) => { await stateSet(env, "last_scan", JSON.stringify({ at: new Date().toISOString(), fatalError: String(error?.message || error) })); }));
-  },
-};
+function decodeXml(value=""){return value.replace(/<!\[CDATA\[|\]\]>/g,"").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">");}
+function parseItems(xml,feed){return [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)].slice(0,15).map(match=>{const block=match[1];const get=tag=>{const found=block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`,"i"));return decodeXml(found?.[1]||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();};return{title:get("title"),link:get("link")||get("guid"),pubDate:get("pubDate")||get("dc:date")||get("date"),source:get("source")||feed.source,publisher:feed.publisher};});}
+async function ensureSchema(env){await env.DB.batch([env.DB.prepare("CREATE TABLE IF NOT EXISTS worker_state (key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),env.DB.prepare("CREATE TABLE IF NOT EXISTS news_queue (fingerprint TEXT PRIMARY KEY,title TEXT NOT NULL,source_url TEXT,primary_source TEXT NOT NULL,sources TEXT NOT NULL,source_count INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'ready',first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_news_queue_status ON news_queue(status,last_seen)")]);}
+async function stateGet(env,key){const row=await env.DB.prepare("SELECT value FROM worker_state WHERE key=?").bind(key).first();return row?.value??null;}
+async function stateSet(env,key,value){await env.DB.prepare("INSERT INTO worker_state(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP").bind(key,String(value)).run();}
+function normalize(text){return String(text||"").toLocaleLowerCase("tr-TR").replace(/[^a-z0-9çğıöşü ]/gi," ").replace(/\s+/g," ").trim();}
+function tokenSet(text){return new Set(normalize(text).split(" ").filter(x=>x.length>2&&!STOP.has(x)));}
+function overlap(a,b){if(!a.size||!b.size)return 0;let shared=0;for(const x of a)if(b.has(x))shared++;return shared/Math.min(a.size,b.size);}
+function eventScore(a,b){const A=tokenSet(a),B=tokenSet(b);let shared=0;for(const x of A)if(B.has(x))shared++;const lexical=overlap(A,B);if(shared>=3&&lexical>=.38)return Math.max(.60,lexical);if(shared>=2&&lexical>=.50)return Math.max(.56,lexical);return lexical;}
+async function sha256(text){const data=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(text));return [...new Uint8Array(data)].map(x=>x.toString(16).padStart(2,"0")).join("");}
+async function eventFingerprint(cluster){const counts=new Map();for(const item of cluster.items)for(const token of tokenSet(item.title))counts.set(token,(counts.get(token)||0)+1);let shared=[...counts].filter(([,count])=>count>=2).map(([token])=>token).sort();if(shared.length<2)shared=[...tokenSet(cluster.primary.title)].sort().slice(0,6);return (await sha256(shared.slice(0,8).join("|"))).slice(0,48);}
+async function telegram(env,method,body={}){if(!env.TELEGRAM_BOT_TOKEN)throw new Error("missing_TELEGRAM_BOT_TOKEN");const response=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const json=await response.json();if(!json.ok)throw new Error(`telegram_${method}:${JSON.stringify(json).slice(0,300)}`);return json.result;}
+async function telegramChatId(env){return env.TELEGRAM_CHAT_ID||await stateGet(env,"telegram_chat_id");}
+async function telegramReady(env){return Boolean(env.TELEGRAM_BOT_TOKEN&&await telegramChatId(env));}
+function shareText(title){const suffix="\n\n#SonDakika #Gündem";let clean=String(title).replace(/\s+-\s+[^-]{2,60}$/,"").trim();if(clean.length>280-suffix.length)clean=clean.slice(0,280-suffix.length-1).trimEnd()+"…";return clean+suffix;}
+function xIntent(title){return `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText(title))}`;}
+async function notifyTelegram(env,item){const chatId=await telegramChatId(env);if(!chatId)return false;await telegram(env,"sendMessage",{chat_id:chatId,text:`📰 +90 GÜNDEM ONAY\n\n${item.title}\n\nKaynaklar: ${item.sources.join(" • ")}\nDoğrulama: ${item.sources.length} bağımsız yayıncı`,disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"✅ ONAYLA",callback_data:`approve:${item.fp}`},{text:"❌ REDDET",callback_data:`reject:${item.fp}`}]]}});return true;}
+async function setupTelegram(request,env){if(!env.TELEGRAM_BOT_TOKEN)return Response.json({status:"error",error:"TELEGRAM_BOT_TOKEN missing"},{status:500});const existing=await telegramChatId(env);if(existing)return Response.json({status:"already_configured",telegram_ready:true});const updates=await telegram(env,"getUpdates",{limit:20,timeout:0,allowed_updates:["message"]});const starts=updates.filter(u=>u.message?.chat?.type==="private"&&String(u.message?.text||"").trim().startsWith("/start"));if(!starts.length)return Response.json({status:"waiting",telegram_ready:false,message:"Bota /start gönderip tekrar aç."});const chatId=String(starts.at(-1).message.chat.id),secret=crypto.randomUUID().replaceAll("-","")+crypto.randomUUID().replaceAll("-","");await stateSet(env,"telegram_chat_id",chatId);await stateSet(env,"telegram_webhook_secret",secret);await telegram(env,"setWebhook",{url:`${new URL(request.url).origin}/telegram/webhook`,secret_token:secret,allowed_updates:["callback_query"],drop_pending_updates:true});await telegram(env,"sendMessage",{chat_id:chatId,text:"✅ +90 GÜNDEM bağlantısı tamamlandı. Doğrulanan haberler onay için buraya gelecek."});return Response.json({status:"configured",telegram_ready:true,webhook_ready:true});}
+async function answerCallback(env,id,text){try{await telegram(env,"answerCallbackQuery",{callback_query_id:id,text});}catch{}}
+async function handleTelegram(request,env){const chatId=await telegramChatId(env),secret=env.TELEGRAM_WEBHOOK_SECRET||await stateGet(env,"telegram_webhook_secret");if(!secret||request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});const update=await request.json(),query=update.callback_query;if(!query?.data)return Response.json({ok:true});if(!chatId||String(query.message?.chat?.id)!==String(chatId)){await answerCallback(env,query.id,"Yetkisiz sohbet");return Response.json({ok:true});}const [action,fp]=query.data.split(":"),row=await env.DB.prepare("SELECT * FROM news_queue WHERE fingerprint=?").bind(fp).first();if(!row){await answerCallback(env,query.id,"Haber bulunamadı");return Response.json({ok:true});}if(action==="reject"){await env.DB.prepare("UPDATE news_queue SET status='rejected',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(fp).run();await telegram(env,"editMessageReplyMarkup",{chat_id:query.message.chat.id,message_id:query.message.message_id,reply_markup:{inline_keyboard:[]}});await answerCallback(env,query.id,"Reddedildi");}else if(action==="approve"){await env.DB.prepare("UPDATE news_queue SET status='approved',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(fp).run();await telegram(env,"editMessageReplyMarkup",{chat_id:query.message.chat.id,message_id:query.message.message_id,reply_markup:{inline_keyboard:[[{text:"𝕏 X'te Paylaş",url:xIntent(row.title)}]]}});await answerCallback(env,query.id,"Onaylandı");}return Response.json({ok:true});}
+async function fetchFeeds(){return Promise.all(FEEDS.map(async feed=>{try{const response=await fetch(feed.url,{headers:{"User-Agent":"90Gundem/1.0",Accept:"application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.5"}});if(!response.ok)return{...feed,ok:false,status:response.status,items:[]};return{...feed,ok:true,status:response.status,items:parseItems(await response.text(),feed)};}catch(error){return{...feed,ok:false,status:0,error:String(error?.message||error),items:[]};}}));}
+function verifiedClusters(fresh,threshold=.52){const clusters=[];for(const item of fresh){let best=null,bestScore=0;for(const cluster of clusters){let score=0;for(const old of cluster.items)score=Math.max(score,eventScore(item.title,old.title));if(score>bestScore){bestScore=score;best=cluster;}}if(best&&bestScore>=threshold){best.items.push(item);best.publishers.add(item.publisher);if(new Date(item.pubDate)>new Date(best.primary.pubDate))best.primary=item;}else clusters.push({primary:item,items:[item],publishers:new Set([item.publisher])});}return clusters.filter(cluster=>cluster.publishers.size>=2).sort((a,b)=>new Date(b.primary.pubDate)-new Date(a.primary.pubDate));}
+async function queueCluster(env,cluster){const fp=await eventFingerprint(cluster),sources=[...cluster.publishers],existing=await env.DB.prepare("SELECT status FROM news_queue WHERE fingerprint=?").bind(fp).first();if(existing){await env.DB.prepare("UPDATE news_queue SET sources=?,source_count=?,last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(JSON.stringify(sources),sources.length,fp).run();return{...cluster.primary,fp,sources,isNew:false,status:existing.status};}await env.DB.prepare("INSERT INTO news_queue(fingerprint,title,source_url,primary_source,sources,source_count,status) VALUES(?,?,?,?,?,?,'ready')").bind(fp,cluster.primary.title,cluster.primary.link,cluster.primary.source,JSON.stringify(sources),sources.length).run();return{...cluster.primary,fp,sources,isNew:true,status:"ready"};}
+async function scan(env,maxAgeOverride=null,mode="scheduled"){await ensureSchema(env);const maxAgeMinutes=maxAgeOverride??Number(env.X_MAX_AGE_MINUTES||3),feeds=await fetchFeeds(),all=feeds.flatMap(feed=>feed.items),now=Date.now();const fresh=all.filter(item=>{const ts=new Date(item.pubDate).getTime(),age=now-ts;return item.title&&Number.isFinite(ts)&&age>=0&&age<=maxAgeMinutes*60000;}).sort((a,b)=>new Date(b.pubDate)-new Date(a.pubDate));const verified=verifiedClusters(fresh,Number(env.NEWS_TITLE_SIMILARITY||.52)),queued=[];let notified=0,lastError=null;for(const cluster of verified.slice(0,5)){const item=await queueCluster(env,cluster);queued.push(item);if(item.isNew&&await telegramReady(env)){try{if(await notifyTelegram(env,item)){await env.DB.prepare("UPDATE news_queue SET status='pending_approval',last_seen=CURRENT_TIMESTAMP WHERE fingerprint=?").bind(item.fp).run();notified++;}}catch(error){lastError=String(error?.message||error);}}}const state={at:new Date().toISOString(),mode,max_age_minutes:maxAgeMinutes,matching:"event-v2-sources5",feed_status:feeds.map(feed=>({source:feed.source,ok:feed.ok,status:feed.status,items:feed.items.length})),fetched:all.length,fresh:fresh.length,verified:verified.length,queued:queued.length,telegram_ready:await telegramReady(env),telegram_notified:notified,x_api_publishing:false,lastError};await stateSet(env,"last_scan",JSON.stringify(state));return state;}
+export default {async fetch(request,env){await ensureSchema(env);const url=new URL(request.url);if(url.pathname==="/telegram-setup"&&request.method==="GET")return setupTelegram(request,env);if(url.pathname==="/telegram/webhook"&&request.method==="POST")return handleTelegram(request,env);if(url.pathname==="/health")return Response.json({status:"ok",service:"90gundem-cloudflare",version:"event-v2-sources5",feeds:FEEDS.length,telegram_ready:await telegramReady(env),x_api_publishing:false});if(url.pathname==="/status"){const raw=await stateGet(env,"last_scan"),queue=await env.DB.prepare("SELECT status,COUNT(*) n FROM news_queue GROUP BY status").all();return Response.json({status:"ok",queue:Object.fromEntries((queue.results||[]).map(x=>[x.status,Number(x.n)])),last_scan:raw?JSON.parse(raw):null});}if(url.pathname==="/run-once"){try{return Response.json({status:"ok",...await scan(env,60,"manual-verification-test")});}catch(error){return Response.json({status:"error",error:String(error?.message||error)},{status:500});}}return new Response("90+ GUNDEM Cloudflare Worker",{status:200});},async scheduled(controller,env,ctx){ctx.waitUntil(scan(env,null,"scheduled").catch(error=>stateSet(env,"last_scan",JSON.stringify({at:new Date().toISOString(),fatalError:String(error?.message||error)})).catch(()=>{})));}};
